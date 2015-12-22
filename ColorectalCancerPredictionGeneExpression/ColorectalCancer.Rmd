@@ -1,0 +1,335 @@
+---
+title: "Colorectal Cancer Prediction, Using Gene Expression Data"
+author: "Santhosh Subramanian"
+output:
+  html_document:
+    number_sections: yes
+    theme: journal
+---
+
+#Introduction
+
+This project attempts to create a prediction model to detect colorectal cancer using gene expression.
+
+As part of the Cancer research conducted at Princeton University, colorectal cancer cells are analyzed with genechip microarrays for differentially expressed genes and this data is publically available at http://genomics-pubs.princeton.edu/oncology/.
+
+The 'Notterman Carcinoma Data' data set from princeton research is used in this project for prediction modelling of colorectal cancer from gene expression.
+
+#About the Data
+
+The notterman data set at http://genomics-pubs.princeton.edu/oncology/Data/CarcinomaNormalDatasetCancerResearch.txt is a data.frame containing 18 paired samples (18 tumor and 18 normal samples) of 7457 gene expression values from Notterman et al. (2001).
+
+1. Variable "Accession Number" is the gene expression accession number.
+
+2. Variable "Description" describes the gene expression.
+
+3. The remaining variables called "Tumor XX" or "Normal XX" are samples with the associated gene expression information. The title itself indicates if the sample was a Tumor or a Normal sample.
+
+4. Variable "T-Test Tumor vs Normal" provides the t-test p-value for each gene expression for tumor vs normal sample.
+
+In the upcoming sections, data is acquired, processed and the prediction model built.
+
+```{r LoadLibs, warning=FALSE, error=FALSE, message=FALSE, echo=TRUE}
+#Load all the necessary libraries for this project and set the working directory in hidden mode.
+
+library (plyr)
+library (caret)
+library (klaR)
+library (MASS)
+library (pROC)
+```
+
+#Download and Read the Data
+
+Data is directly downloaded from the source URL http://genomics-pubs.princeton.edu/oncology/Data/CarcinomaNormalDatasetCancerResearch.txt and stored as CarcinomaNormalDatasetCancerResearch.txt.
+
+```{r DownloadData}
+fileName = "CarcinomaNormalDatasetCancerResearch.txt"
+if (!file.exists (fileName))
+    download.file (url = "http://genomics-pubs.princeton.edu/oncology/Data/CarcinomaNormalDatasetCancerResearch.txt", destfile = fileName)
+```
+
+The gene expression data is read. While reading, the following are performed:
+
+1. The first 8 lines do not contain the gene expression data and are hence skipped.
+
+2. The name of the columns are explicitely specified, for ease of use and readability.
+
+3. The data values are separated by tabs and this is specified while reading. However, there are few empty double tabs and to overcome these, variables Dummy1-5 are used in the column names.
+
+4. As the gene expression description contains '#', which are typically used as a comment character, this can lead to data being incorrectly read. This overcome by overriding the comment character.
+
+Data is read into a data frame called **data**.
+
+```{r ReadData}
+colNames = c ("AccessionNumber", "DescriptionSample", "Dummy1", 
+              "Tumor27", "Tumor29", "Tumor34", "Tumor28", "Tumor35",
+              "Tumor8", "Tumor3", "Tumor9", "Tumor4", "Tumor32", 
+              "Tumor39", "Tumor10", "Tumor33", "Tumor5", "Tumor11",
+              "Tumor6", "Tumor12", "Tumor40", "Normal27", "Normal29",
+              "Normal34", "Normal28", "Normal35", "Normal8", "Normal3",
+              "Normal9", "Normal4", "Normal32", "Normal39", "Normal10",
+              "Normal33", "Normal5", "Normal11", "Normal6", "Normal12",
+              "Normal40", "TTestTumorVSNormal",
+              "Dummy2", "Dummy3", "Dummy4", "Dummy5")
+
+data = read.table (fileName, header = FALSE, stringsAsFactors = FALSE, 
+                   quote = "", skip = 8, sep = "\t", comment.char = "",
+                   col.names = colNames)
+```
+
+Below is a glimpse of the data and the class of each variable. All the variables are read in the proper class type.
+
+```{r Str}
+str (data)
+```
+
+#Clean the Data
+
+Data is cleaned by removing the variables Dummy1-5. NAs from the last two rows are also removed.
+
+A dictionary of translation between AccessionNumber and DescriptionSample is created. The variable DescriptionSample is then removed.
+
+```{r CleanData}
+#Verify that the Dummy1-5 variables are only NAs. This yields all zeros. 
+#   Commenting out to keep the report concise.
+#sum (!is.na (data$Dummy1)); sum (!is.na (data$Dummy2))
+#sum (!is.na (data$Dummy3)); sum (!is.na (data$Dummy4))
+#sum (!is.na (data$Dummy5))
+
+data$Dummy1 = NULL; data$Dummy2 = NULL; data$Dummy3 = NULL
+data$Dummy4 = NULL; data$Dummy5 = NULL
+
+dictionary = subset (data, select = c (AccessionNumber, DescriptionSample))
+
+data$DescriptionSample = NULL
+
+#summary (data)
+data = data [-7466, ]
+data = data [-7465, ]
+```
+
+The data is now clean and ready for transformations.
+
+#Explore and Transform the Data
+
+Data is explored and transformed as follows:
+
+1. The variable TTestTumorVSNormal consists of the t-test result (p-value) for each gene expression. The t-test tests the null hypothesis that the mean of a gene expression is the same for both sample types - Tumor and Normal. 
+
+When the p-value is significant 0.05 or lesser, then the alternate hypothesis that the means are different is true. Which in turn means that the particular gene expression is a good predictor of the sample type - Tumor or Normal.
+
+The below shows that there are 2096 gene expressions that have a significant p-value and would be good predictors of sample type. The non-significant predictors are removed from the dataset.
+
+```{r TransformData0}
+indexOfSigPredictors = which (data$TTestTumorVSNormal <= 0.05, arr.ind = T)
+length (indexOfSigPredictors)
+
+data = data [indexOfSigPredictors, ]
+data$TTestTumorVSNormal = NULL
+```
+
+2. The outcome (predicted value) is not available as a variable for the modelling. Hence, a new variable called 'tumor' specifying if the sample is a tumor sample or not is created based on the samples' names.
+
+```{r TransformData1}
+#Tumor or Normal
+#"Tumor27", "Tumor29", "Tumor34", "Tumor28", "Tumor35",
+# "Tumor8", "Tumor3", "Tumor9", "Tumor4", "Tumor32", 
+# "Tumor39", "Tumor10", "Tumor33", "Tumor5", "Tumor11",
+# "Tumor6", "Tumor12", "Tumor40", "Normal27", "Normal29",
+# "Normal34", "Normal28", "Normal35", "Normal8", "Normal3",
+# "Normal9", "Normal4", "Normal32", "Normal39", "Normal10",
+# "Normal33", "Normal5", "Normal11", "Normal6", "Normal12",
+# "Normal40"
+tumor = c ("Yes", "Yes", "Yes", "Yes", "Yes",
+           "Yes", "Yes", "Yes", "Yes", "Yes",
+           "Yes", "Yes", "Yes", "Yes", "Yes",
+           "Yes", "Yes", "Yes", "No", "No",
+           "No", "No", "No", "No", "No",
+           "No", "No", "No", "No", "No",
+           "No", "No", "No", "No", "No",
+           "No")
+```
+
+3. The next intended tranformation is to make the samples as rows of data and the gene accession numbers as columns (or predictor variables). 
+
+4. Before we do this, we need to check if the AccessionNumbers are indeed unique as they are expected to be. The below shows that they are not and nearly 800 duplicates exist.
+
+```{r TransformData2}
+dim (data)
+length (unique (data$AccessionNumber))
+```
+
+5. The best way to handle this would be to communicate with the research group to understand and rectify in the best suitable manner. Considering that we cannot do it now, below are the two options available (both yield a similar variable importance upon modelling - not shown in this project for the sake of simplicity)
+    
+First choice, calculate the mean for each repeated AccessionNumber and then use the means and eliminate the duplicates. We will call this new data frame **dupRemData**
+
+```{r TransformData3}
+dupRemData =  ddply (data, .(AccessionNumber), summarize, 
+                     Tumor27 = mean (Tumor27), Tumor29 = mean (Tumor29),
+                     Tumor34 = mean (Tumor34), Tumor28 = mean (Tumor28),
+                     Tumor35 = mean (Tumor35), Tumor8 = mean (Tumor8),
+                     Tumor3 = mean (Tumor3), Tumor9 = mean (Tumor9),
+                     Tumor4 = mean (Tumor4), Tumor32 = mean (Tumor32),
+                     Tumor39 = mean (Tumor39), Tumor10 = mean (Tumor10),
+                     Tumor33 = mean (Tumor33), Tumor5 = mean (Tumor5),
+                     Tumor11 = mean (Tumor11), Tumor6 = mean (Tumor6),
+                     Tumor12 = mean (Tumor12), Tumor40 = mean (Tumor40),
+                     Normal27 = mean (Normal27), Normal29 = mean (Normal29),
+                     Normal34 = mean (Normal34), Normal28 = mean (Normal28),
+                     Normal35 = mean (Normal35), Normal8 = mean (Normal8),
+                     Normal3 = mean (Normal3), Normal9 = mean (Normal9),
+                     Normal4 = mean (Normal4), Normal32 = mean (Normal32),
+                     Normal39 = mean (Normal39), Normal10 = mean (Normal10),
+                     Normal33 = mean (Normal33), Normal5 = mean (Normal5),
+                     Normal11 = mean (Normal11), Normal6 = mean (Normal6),
+                     Normal12 = mean (Normal12), Normal40 = mean (Normal40))
+```
+
+A sanity check is also performed on the duplicate removal by printing the values of AccessionNumber U22055 which did not have a duplicate before and after the transformation. And the values of AccessionNumber X53416 which repeated thrice.
+
+```{r TransformData4}
+dupRemData[dupRemData$AccessionNumber == "U22055", ]
+data[data$AccessionNumber == "U22055", ]
+dupRemData[dupRemData$AccessionNumber == "X53416", ]
+data[data$AccessionNumber == "X53416", ]
+```
+
+Now the data frame is transposed to make the AccessionNumber the predictor variables. The outcome variable is also attached to the data frame as dependent variable **tumor**.
+    
+This new data frame is **geneExpDupAvgData**.
+    
+```{r TransformData5}
+row.names (dupRemData) = dupRemData$AccessionNumber
+dupRemData$AccessionNumber = NULL
+
+geneExpDupAvgData = data.frame (t(dupRemData))
+geneExpDupAvgData$tumor = factor (tumor)
+dim (geneExpDupAvgData)
+```
+
+Second choice, would be to rename the duplicated by appending a _1, _2, and so on. This may be a good choice if a gene expression was incorrectly named. This new AccessionNumber is called AccessionNumber.new.
+    
+This new data frame with renamed AccessionNumber is dupRenameData. 
+    
+Similar to the previous choice, the data is transposed and the independent variable **tumor** added.
+    
+This new data frame is **transposedData**.
+    
+```{r TransformData6}
+dupRenameData = transform (data, 
+                    AccessionNumber.new = ifelse (
+                        duplicated(AccessionNumber) | 
+                            duplicated(AccessionNumber, fromLast=TRUE), 
+                         
+                        paste (AccessionNumber, 
+                               ave (AccessionNumber, AccessionNumber, 
+                                    FUN=seq_along), 
+                               sep='_'), 
+                        AccessionNumber)
+                    )
+dupRenameData$AccessionNumber = NULL
+
+row.names (dupRenameData) = dupRenameData$AccessionNumber.new
+dupRenameData$AccessionNumber.new = NULL
+
+geneExpDupRenamedData = data.frame (t(dupRenameData))
+geneExpDupRenamedData$tumor = factor (tumor)
+dim (geneExpDupRenamedData)
+```
+
+**Now the data sets geneExpDupAvgData (with duplicates averaged) and transposedData (with duplicated renamed) are ready for modelling.**
+
+#Prediction Model Building
+
+For a dataset such as this where the number of predictor variable are enourmous (here 7000+) compared to the number of observations or samples (here 36), one of the best classifiers would be the **naive bayes' classifier.**
+
+We will use the naive bayes' through the **caret package**, with a cross validation option of **Leave One Out Cross Validation** to overcome overfitting.
+
+For ease of modelling for this project we will use only the **geneExpDupRenamedData** dataset.
+
+##Partition Data into Train and Test
+
+Partitioning the data into training and test should have been the first operation right after downloading the data. Due to the amount of cleaning and transformation needed, it is done here (Highly recommended to be moved up before cleaning and transformation to avoid overfitting). 
+
+Data is partitioned at a 70-30 of training-test.
+
+```{r DataPartition}
+set.seed (32523)
+inTrain = createDataPartition (y = geneExpDupRenamedData$tumor, p = 0.7, 
+                               list = FALSE)
+myTrain = geneExpDupRenamedData [inTrain, ]
+myTest = geneExpDupRenamedData [-inTrain, ]
+dim(myTrain); dim(myTest)
+```
+
+The training data is used for modelling and the test data for model verification.
+
+##Preprocessing for Model Building
+
+Scaling and centering is a preprocessing that will be performed, so that not any one gene expression influences the outcome more.
+
+Also, based on the below, several gene expressions are higly correlated. To overcome this, principal component analysis is also performed as a preprocessing step.
+
+(Output is not printed due to it's enormity).
+
+```{r Preprocess1}
+corMat = cor (myTrain[, !colnames(myTrain) %in% c("tumor")])
+diag (corMat) = 0 #Remove self correlations
+#which (abs(corMat) > 0.8, arr.ind = T)
+```
+
+```{r PreProcess2}
+preProc = c("center", "scale", "pca")
+```
+
+##Cross Validation
+
+As mentioned earlier, cross validation is performed to avoid overfitting. Leave One Out is chosen due to the low sample size.
+
+```{r CV}
+trCtrl = trainControl (method = "LOOCV")
+```
+
+##Build the Prediction Model
+
+Finally, the model is build using the naive bayes' classifier on the training data with preprocessing options of centering, scaling, PCA and the cross validation option if LOOCV.
+
+```{r BuildModel1, warning=FALSE}
+set.seed (32523)
+modelFit = train (tumor ~ ., data = myTrain, trControl = trCtrl, 
+             preProcess = preProc, method = "nb")
+
+confusionMatrix (myTrain$tumor, predict (modelFit, myTrain))
+```
+
+The confusion matrix above shows that the **in-sample prediction error is 0%**, implying that **all the samples in the training dataset have been correctly identified to be tumor or not by the build naive bayes' classifier model**.
+
+##Measuring the Performance of the model
+
+Next we apply the built model to the test dataset.
+
+The below confusion matrix shows that the **out-of-sample prediction error is 10%, with a specificity of 83.3% and sensitivity of 100%. This means that our model has been able to identify all tumor samples correctly, and 83% of the normal samples correctly.**
+
+```{r BuildModel2, warning=FALSE}
+confusionMatrix (myTest$tumor, predict (modelFit, myTest))
+```
+
+##Variable Importance in Model
+
+Below are the top 20 gene expressions that have been crucial in the classification of tumor in the build model.
+
+```{r VarImp}
+varImp (modelFit)
+```
+
+#Summary
+
+**The usage of data science for healthcare and IOT is a wave that will disrupt and make human life better.**
+
+**This project is one such that will help identify colorectal cancer from microarray gene expression.**
+
+**The model has been able to perform with an accuracy of 90% on out-of-sample test data with a training performed on a small dataset of 30 samples.**
+
+**Increasing the sample size is likely to increase the prediction accuracy and there by aid better diagnosis, research and understanding of colorectal cancer.**
+
